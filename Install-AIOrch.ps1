@@ -279,6 +279,16 @@ if (-not $SkipCiel) {
             & (Get-PsExe) -NoProfile -ExecutionPolicy Bypass -File (Join-Path $InstallRoot "scripts\Set-AIWorkPetStartup.ps1") -Action Enable
             if ($LASTEXITCODE -ne 0) { throw "Set-AIWorkPetStartup.ps1 failed (exit $LASTEXITCODE)" }
         }
+    # A local watchdog: the mailbox page is the only remote way to update or restart Ciel, so the computer itself
+    # checks Ciel every 15 minutes and restarts it the graceful way when it is unreachable or runs stale code.
+    Invoke-Step -Name "ciel-watchdog" -Plan "scripts\Set-AIWorkPetWatchdog.ps1 -Action Enable (scheduled task Show_CielWatchdog)" `
+        -IsDone {
+            return ($null -ne (Get-ScheduledTask -TaskName "Show_CielWatchdog" -TaskPath "\" -ErrorAction SilentlyContinue))
+        } `
+        -Action {
+            & (Get-PsExe) -NoProfile -ExecutionPolicy Bypass -File (Join-Path $InstallRoot "scripts\Set-AIWorkPetWatchdog.ps1") -Action Enable
+            if ($LASTEXITCODE -ne 0) { throw "Set-AIWorkPetWatchdog.ps1 failed (exit $LASTEXITCODE)" }
+        }
     Invoke-Step -Name "ciel-launch" -Plan "wscript scripts\Show-AIWorkPet.vbs" `
         -IsDone {
             $code = Get-HttpStatus "http://127.0.0.1:$($ServePorts[0])/"
