@@ -41,7 +41,11 @@ $ErrorActionPreference = "Stop"
 if ($env:OS -ne "Windows_NT") { throw "Install-AIOrch supports Windows only." }
 
 function Get-DefaultInstallRoot {
-    if (Test-Path -LiteralPath "D:\" -PathType Container) { return "D:\AI_Orchestrator" }
+    # Only a fixed disk counts: on a host whose D: is a DVD or card reader the clone went to a read-only drive.
+    try {
+        $d = New-Object System.IO.DriveInfo "D"
+        if ($d.IsReady -and $d.DriveType -eq [System.IO.DriveType]::Fixed) { return "D:\AI_Orchestrator" }
+    } catch { }
     return (Join-Path $HOME "AI_Orchestrator")
 }
 if ([string]::IsNullOrWhiteSpace($InstallRoot)) { $InstallRoot = Get-DefaultInstallRoot }
@@ -106,11 +110,30 @@ function Invoke-Step {
     $script:Results.Add([pscustomobject]@{ step = $Name; status = "done"; plan = $Plan })
 }
 
+# Windows PowerShell 5.1 (the only PowerShell on a fresh Windows) turns redirected stderr of a native command
+# into an error record, and "Stop" makes that fatal: "gh auth status" on a host that is not signed in yet
+# ended the whole install. Probes run through these two helpers, which relax the preference locally.
+function Test-NativeOk {
+    param([string]$File, [string[]]$Arguments)
+    $ErrorActionPreference = "Continue"
+    try { & $File @Arguments *> $null } catch { return $false }
+    return ($LASTEXITCODE -eq 0)
+}
+
+function Get-NativeText {
+    param([string]$File, [string[]]$Arguments)
+    $ErrorActionPreference = "Continue"
+    $raw = $null
+    try { $raw = & $File @Arguments 2>$null } catch { return $null }
+    if ($LASTEXITCODE -ne 0 -or -not $raw) { return $null }
+    return ($raw | Out-String)
+}
+
 function Get-TailscaleState {
     if (-not (Test-Command "tailscale")) { return $null }
-    $raw = & tailscale status --json 2>$null
-    if ($LASTEXITCODE -ne 0 -or -not $raw) { return $null }
-    try { return ($raw | Out-String | ConvertFrom-Json) } catch { return $null }
+    $raw = Get-NativeText "tailscale" @("status", "--json")
+    if (-not $raw) { return $null }
+    try { return ($raw | ConvertFrom-Json) } catch { return $null }
 }
 
 function Test-TailscaleConnected {
@@ -120,8 +143,7 @@ function Test-TailscaleConnected {
 
 function Test-GhLoggedIn {
     if (-not (Test-Command "gh")) { return $false }
-    & gh auth status --hostname github.com *> $null
-    return ($LASTEXITCODE -eq 0)
+    return (Test-NativeOk "gh" @("auth", "status", "--hostname", "github.com"))
 }
 
 function Test-GitRepo([string]$Path) {
@@ -130,9 +152,9 @@ function Test-GitRepo([string]$Path) {
 
 function Test-ServePort([int]$Port) {
     if (-not (Test-Command "tailscale")) { return $false }
-    $raw = & tailscale serve status --json 2>$null
-    if ($LASTEXITCODE -ne 0 -or -not $raw) { return $false }
-    try { $serve = ($raw | Out-String | ConvertFrom-Json) } catch { return $false }
+    $raw = Get-NativeText "tailscale" @("serve", "status", "--json")
+    if (-not $raw) { return $false }
+    try { $serve = ($raw | ConvertFrom-Json) } catch { return $false }
     if ($null -eq $serve -or -not $serve.PSObject.Properties["TCP"] -or $null -eq $serve.TCP) { return $false }
     $entry = $serve.TCP.PSObject.Properties[[string]$Port]
     $key = $ServeKind.ToUpperInvariant()
@@ -173,18 +195,17 @@ foreach ($package in $packages) {
         -IsDone { Test-Command $p.Name } `
         -Action {
             if (-not (Test-Command "winget")) { throw "winget is missing; install App Installer from the Microsoft Store first." }
-            Invoke-Native "winget" @("install", "--id", $p.Id, "--exact", "--silent", "--accept-package-agreements", "--accept-source-agreements")
+            Invoke-Native "winget" @("install", "--id", $p.Id, "--exact", "--source", "winget", "--silent", "--accept-package-agreements", "--accept-source-agreements")
             Update-SessionPath
         }
 }
 Invoke-Step -Name "install-python314" -Plan "winget install --id Python.Python.3.14" `
     -IsDone {
         if (-not (Test-Command "py")) { return $false }
-        & py -3.14 -c "import sys" *> $null
-        return ($LASTEXITCODE -eq 0)
+        return (Test-NativeOk "py" @("-3.14", "-c", "import sys"))
     } `
     -Action {
-        Invoke-Native "winget" @("install", "--id", "Python.Python.3.14", "--exact", "--silent", "--accept-package-agreements", "--accept-source-agreements")
+        Invoke-Native "winget" @("install", "--id", "Python.Python.3.14", "--exact", "--source", "winget", "--silent", "--accept-package-agreements", "--accept-source-agreements")
         Update-SessionPath
     }
 
@@ -209,8 +230,7 @@ Invoke-Step -Name "venv" -Plan "py -3.14 -m venv .venv; pip install -e .[desktop
     -IsDone {
         $py = Get-VenvPython
         if (-not (Test-Path -LiteralPath $py)) { return $false }
-        & $py -c "import ai_orchestrator, PIL" *> $null
-        return ($LASTEXITCODE -eq 0)
+        return (Test-NativeOk $py @("-c", "import ai_orchestrator, PIL"))
     } `
     -Action {
         $py = Get-VenvPython
@@ -229,7 +249,7 @@ Invoke-Step -Name "tailnet" -Plan ($loginPlan + $approvePlan) `
     -IsDone {
         if (-not (Test-TailscaleConnected)) { return $false }
         if ($LoginServer) {
-            $prefs = & tailscale debug prefs 2>$null | Out-String
+            $prefs = Get-NativeText "tailscale" @("debug", "prefs")
             $current = ""
             try { $current = ($prefs | ConvertFrom-Json).ControlURL } catch { $current = "" }
             if ($current -and ($current.TrimEnd("/") -ne $LoginServer.TrimEnd("/"))) {
@@ -252,8 +272,8 @@ Invoke-Step -Name "machine-bootstrap" -Plan "scripts\Initialize-AIMachine.ps1 -P
     -IsDone {
         $wrapper = Join-Path $InstallRoot "scripts\Invoke-AIController.ps1"
         if (-not (Test-Path -LiteralPath $wrapper)) { return $false }
-        $out = & (Get-PsExe) -NoProfile -ExecutionPolicy Bypass -File $wrapper rules-sync check 2>$null | Out-String
-        return ($LASTEXITCODE -eq 0 -and $out -match '"status":\s*"current"')
+        $out = Get-NativeText (Get-PsExe) @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $wrapper, "rules-sync", "check")
+        return ([bool]$out -and $out -match '"status":\s*"current"')
     } `
     -Action {
         $init = Join-Path $InstallRoot "scripts\Initialize-AIMachine.ps1"
@@ -338,7 +358,7 @@ if ($Json) {
     Write-Host ""
     if ($DryRun) {
         Write-Host "Dry run only: nothing was changed."
-    } elseif (($checks.Values | Where-Object { $_ -is [bool] -and -not $_ }).Count -eq 0) {
+    } elseif (@($checks.Values | Where-Object { $_ -is [bool] -and -not $_ }).Count -eq 0) {
         Write-Host "Install complete. Next: sign in to Claude/Codex yourself, then send a test letter from Ciel to another host."
     } else {
         Write-Host "Install finished with failed checks:"
