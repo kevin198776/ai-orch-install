@@ -15,6 +15,11 @@
   gh browser login, Claude/Codex login) is done by the owner in the browser.
   It never runs "tailscale up" on a host that is already connected, so an existing host is never moved
   off its current tailnet; changing the login server of a connected host is refused (that is gate G4).
+
+  Network: by default the host joins the owner's own control server (CielSpace, a self-hosted Headscale with
+  its own relay), so hosts reach each other without Tailscale's account or coordination service. The new
+  device is approved from a host that is already on that network. "-LoginServer official" joins Tailscale's
+  own network instead. Only the Tailscale client program is used in both cases.
 #>
 [CmdletBinding()]
 param(
@@ -23,7 +28,7 @@ param(
     [string]$SecondBrainRepository = "kevin198776/SecondBrain",
     [string]$SecondBrainPath = "",
     [string]$ProjectRegistryPath = "",
-    [string]$LoginServer = "",
+    [string]$LoginServer = "https://hs.wealthwaifu.org",
     [int[]]$ServePorts = @(8791, 8792),
     [switch]$SkipCiel,
     [switch]$DryRun,
@@ -49,6 +54,15 @@ foreach ($pathValue in @($InstallRoot, $SecondBrainPath, $ProjectRegistryPath)) 
 }
 if ($Repository -notmatch '^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$') { throw "Invalid repository: $Repository" }
 if ($SecondBrainRepository -notmatch '^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$') { throw "Invalid repository: $SecondBrainRepository" }
+$UseOfficial = ($LoginServer -eq "official")
+if ($UseOfficial) { $LoginServer = "" }
+if (-not $UseOfficial -and [string]::IsNullOrWhiteSpace($LoginServer)) {
+    throw 'LoginServer is empty: pass the control server URL, or "official" for Tailscale''s own network.'
+}
+# Tailscale's network issues HTTPS certificates for serve; a self-hosted control server does not (HTTP serve,
+# still tailnet only and encrypted by the tailnet itself).
+$ServeKind = "http"
+if ($UseOfficial) { $ServeKind = "https" }
 if ($LoginServer -and $LoginServer -notmatch '^https://[A-Za-z0-9.-]+(:[0-9]+)?/?$') {
     throw "LoginServer must be an https URL without a path: $LoginServer"
 }
@@ -121,7 +135,8 @@ function Test-ServePort([int]$Port) {
     try { $serve = ($raw | Out-String | ConvertFrom-Json) } catch { return $false }
     if ($null -eq $serve -or -not $serve.PSObject.Properties["TCP"] -or $null -eq $serve.TCP) { return $false }
     $entry = $serve.TCP.PSObject.Properties[[string]$Port]
-    return ($null -ne $entry -and $entry.Value.PSObject.Properties["HTTPS"] -and $entry.Value.HTTPS -eq $true)
+    $key = $ServeKind.ToUpperInvariant()
+    return ($null -ne $entry -and $entry.Value.PSObject.Properties[$key] -and $entry.Value.$key -eq $true)
 }
 
 function Get-HttpStatus([string]$Uri) {
@@ -205,8 +220,12 @@ Invoke-Step -Name "venv" -Plan "py -3.14 -m venv .venv; pip install -e .[desktop
 
 # 4. Tailnet (never re-run "up" on a connected host) -------------------------------------------------
 $loginPlan = "tailscale up (official login server)"
-if ($LoginServer) { $loginPlan = "tailscale up --login-server $LoginServer" }
-Invoke-Step -Name "tailnet" -Plan ($loginPlan + "; approve the device in the browser") `
+$approvePlan = "; approve the device in the browser"
+if ($LoginServer) {
+    $loginPlan = "tailscale up --login-server $LoginServer"
+    $approvePlan = "; approve the device from a host already on that network"
+}
+Invoke-Step -Name "tailnet" -Plan ($loginPlan + $approvePlan) `
     -IsDone {
         if (-not (Test-TailscaleConnected)) { return $false }
         if ($LoginServer) {
@@ -214,7 +233,7 @@ Invoke-Step -Name "tailnet" -Plan ($loginPlan + "; approve the device in the bro
             $current = ""
             try { $current = ($prefs | ConvertFrom-Json).ControlURL } catch { $current = "" }
             if ($current -and ($current.TrimEnd("/") -ne $LoginServer.TrimEnd("/"))) {
-                throw "This host is connected to $current. Moving it to $LoginServer is gate G4 and is not done by the installer."
+                throw "This host is connected to $current. Moving it to $LoginServer is gate G4 and is not done by the installer (use scripts\Join-CielSpace.ps1 to move it, or -LoginServer official to keep it)."
             }
         }
         return $true
@@ -247,9 +266,9 @@ Invoke-Step -Name "machine-bootstrap" -Plan "scripts\Initialize-AIMachine.ps1 -P
 if (-not $SkipCiel) {
     foreach ($port in $ServePorts) {
         $servePort = $port
-        Invoke-Step -Name ("serve-" + $servePort) -Plan ("tailscale serve --bg --https={0} http://127.0.0.1:{0} (tailnet only)" -f $servePort) `
+        Invoke-Step -Name ("serve-" + $servePort) -Plan ("tailscale serve --bg --{1}={0} http://127.0.0.1:{0} (tailnet only)" -f $servePort, $ServeKind) `
             -IsDone { Test-ServePort $servePort } `
-            -Action { Invoke-Native "tailscale" @("serve", "--bg", ("--https={0}" -f $servePort), ("http://127.0.0.1:{0}" -f $servePort)) }
+            -Action { Invoke-Native "tailscale" @("serve", "--bg", ("--{1}={0}" -f $servePort, $ServeKind), ("http://127.0.0.1:{0}" -f $servePort)) }
     }
     Invoke-Step -Name "ciel-startup" -Plan "scripts\Set-AIWorkPetStartup.ps1 -Action Enable" `
         -IsDone {
