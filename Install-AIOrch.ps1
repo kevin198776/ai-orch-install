@@ -193,24 +193,17 @@ Update-SessionPath
 $packages = @(
     @{ Name = "git"; Id = "Git.Git" },
     @{ Name = "gh"; Id = "GitHub.cli" },
-    @{ Name = "tailscale"; Id = "Tailscale.Tailscale" },
-    # The Codex program depends on this runtime; left to winget it asks for administrator approval on its own.
-    @{ Name = "vcredist"; Id = "Microsoft.VCRedist.2015+.x64" }
+    @{ Name = "tailscale"; Id = "Tailscale.Tailscale" }
 )
-function Test-PackagePresent($Package) {
-    if ($Package.Name -ne "vcredist") { return (Test-Command $Package.Name) }
-    $runtime = Get-ItemProperty -LiteralPath "HKLM:\SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64" -ErrorAction SilentlyContinue
-    return ($null -ne $runtime -and $runtime.PSObject.Properties["Installed"] -and $runtime.Installed -eq 1)
-}
 # Each of these installers asks for administrator approval, and the GitHub CLI prompt opened behind
 # the other windows on a fresh Windows 11. When two or more are missing they are installed together in one
 # elevated window, so the owner approves once. Declining it, or any failure there, falls back to the
 # one-by-one steps below, which also verify the result.
 Invoke-Step -Name "install-tools-once" -Plan "one administrator approval for the missing tools (winget install)" `
-    -IsDone { @($packages | Where-Object { -not (Test-PackagePresent $_) }).Count -lt 2 } `
+    -IsDone { @($packages | Where-Object { -not (Test-Command $_.Name) }).Count -lt 2 } `
     -Action {
         if (-not (Test-Command "winget")) { throw "winget is missing; install App Installer from the Microsoft Store first." }
-        $ids = @($packages | Where-Object { -not (Test-PackagePresent $_) } | ForEach-Object { $_.Id })
+        $ids = @($packages | Where-Object { -not (Test-Command $_.Name) } | ForEach-Object { $_.Id })
         $command = (@($ids | ForEach-Object { "winget " + ((Get-WingetInstallArguments $_) -join " ") }) -join "; ")
         try {
             Start-Process -FilePath "powershell.exe" -Verb RunAs -Wait `
@@ -223,7 +216,7 @@ Invoke-Step -Name "install-tools-once" -Plan "one administrator approval for the
 foreach ($package in $packages) {
     $p = $package
     Invoke-Step -Name ("install-" + $p.Name) -Plan ("winget install --id " + $p.Id) `
-        -IsDone { Test-PackagePresent $p } `
+        -IsDone { Test-Command $p.Name } `
         -Action {
             if (-not (Test-Command "winget")) { throw "winget is missing; install App Installer from the Microsoft Store first." }
             Invoke-Native "winget" (Get-WingetInstallArguments $p.Id)
@@ -239,16 +232,14 @@ Invoke-Step -Name "install-python314" -Plan "winget install --id Python.Python.3
         Invoke-Native "winget" (Get-WingetInstallArguments "Python.Python.3.14")
         Update-SessionPath
     }
-# The mayors run on these two command-line programs; the owner still signs in to each one personally.
-foreach ($package in @(@{ Name = "claude"; Id = "Anthropic.ClaudeCode" }, @{ Name = "codex"; Id = "OpenAI.Codex" })) {
-    $p = $package
-    Invoke-Step -Name ("install-" + $p.Name) -Plan ("winget install --id " + $p.Id) `
-        -IsDone { Test-Command $p.Name } `
-        -Action {
-            Invoke-Native "winget" (Get-WingetInstallArguments $p.Id)
-            Update-SessionPath
-        }
-}
+# The mayors run on the Claude Code program; the owner still signs in personally. Codex is not installed here:
+# its winget package unpacks as codex-x86_64-pc-windows-msvc.exe and gives no "codex" command to a standard user.
+Invoke-Step -Name "install-claude" -Plan "winget install --id Anthropic.ClaudeCode" `
+    -IsDone { Test-Command "claude" } `
+    -Action {
+        Invoke-Native "winget" (Get-WingetInstallArguments "Anthropic.ClaudeCode")
+        Update-SessionPath
+    }
 
 # 2. GitHub sign-in (browser; the owner approves the one-time device code) ---------------------------
 Invoke-Step -Name "gh-login" -Plan "gh auth login --web --hostname github.com --git-protocol https (approve in the browser)" `
