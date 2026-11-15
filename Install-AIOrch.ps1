@@ -77,12 +77,18 @@ function Update-SessionPath {
     $machine = [Environment]::GetEnvironmentVariable("Path", "Machine")
     $user = [Environment]::GetEnvironmentVariable("Path", "User")
     $env:Path = (@($machine, $user) | Where-Object { $_ }) -join ";"
-    foreach ($extra in @("$env:ProgramFiles\Tailscale", "$env:ProgramFiles\GitHub CLI", "$env:ProgramFiles\Git\cmd")) {
+    foreach ($extra in @("$env:ProgramFiles\Tailscale", "$env:ProgramFiles\GitHub CLI", "$env:ProgramFiles\Git\cmd",
+            "$env:LOCALAPPDATA\Microsoft\WinGet\Links")) {
         if ((Test-Path -LiteralPath $extra) -and ($env:Path -notlike "*$extra*")) { $env:Path = "$env:Path;$extra" }
     }
 }
 
 function Test-Command([string]$Name) { return [bool](Get-Command $Name -ErrorAction SilentlyContinue) }
+
+# "--source winget": on a fresh Windows 11 the msstore source failed its certificate check and winget stopped.
+function Get-WingetInstallArguments([string]$Id) {
+    return @("install", "--id", $Id, "--exact", "--source", "winget", "--silent", "--accept-package-agreements", "--accept-source-agreements")
+}
 
 function Invoke-Native {
     param([string]$File, [string[]]$Arguments)
@@ -187,15 +193,40 @@ Update-SessionPath
 $packages = @(
     @{ Name = "git"; Id = "Git.Git" },
     @{ Name = "gh"; Id = "GitHub.cli" },
-    @{ Name = "tailscale"; Id = "Tailscale.Tailscale" }
+    @{ Name = "tailscale"; Id = "Tailscale.Tailscale" },
+    # The Codex program depends on this runtime; left to winget it asks for administrator approval on its own.
+    @{ Name = "vcredist"; Id = "Microsoft.VCRedist.2015+.x64" }
 )
+function Test-PackagePresent($Package) {
+    if ($Package.Name -ne "vcredist") { return (Test-Command $Package.Name) }
+    $runtime = Get-ItemProperty -LiteralPath "HKLM:\SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64" -ErrorAction SilentlyContinue
+    return ($null -ne $runtime -and $runtime.PSObject.Properties["Installed"] -and $runtime.Installed -eq 1)
+}
+# Each of these installers asks for administrator approval, and the GitHub CLI prompt opened behind
+# the other windows on a fresh Windows 11. When two or more are missing they are installed together in one
+# elevated window, so the owner approves once. Declining it, or any failure there, falls back to the
+# one-by-one steps below, which also verify the result.
+Invoke-Step -Name "install-tools-once" -Plan "one administrator approval for the missing tools (winget install)" `
+    -IsDone { @($packages | Where-Object { -not (Test-PackagePresent $_) }).Count -lt 2 } `
+    -Action {
+        if (-not (Test-Command "winget")) { throw "winget is missing; install App Installer from the Microsoft Store first." }
+        $ids = @($packages | Where-Object { -not (Test-PackagePresent $_) } | ForEach-Object { $_.Id })
+        $command = (@($ids | ForEach-Object { "winget " + ((Get-WingetInstallArguments $_) -join " ") }) -join "; ")
+        try {
+            Start-Process -FilePath "powershell.exe" -Verb RunAs -Wait `
+                -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", $command)
+        } catch {
+            Write-Host "The single administrator approval was not given; installing the tools one by one."
+        }
+        Update-SessionPath
+    }
 foreach ($package in $packages) {
     $p = $package
     Invoke-Step -Name ("install-" + $p.Name) -Plan ("winget install --id " + $p.Id) `
-        -IsDone { Test-Command $p.Name } `
+        -IsDone { Test-PackagePresent $p } `
         -Action {
             if (-not (Test-Command "winget")) { throw "winget is missing; install App Installer from the Microsoft Store first." }
-            Invoke-Native "winget" @("install", "--id", $p.Id, "--exact", "--source", "winget", "--silent", "--accept-package-agreements", "--accept-source-agreements")
+            Invoke-Native "winget" (Get-WingetInstallArguments $p.Id)
             Update-SessionPath
         }
 }
@@ -205,9 +236,19 @@ Invoke-Step -Name "install-python314" -Plan "winget install --id Python.Python.3
         return (Test-NativeOk "py" @("-3.14", "-c", "import sys"))
     } `
     -Action {
-        Invoke-Native "winget" @("install", "--id", "Python.Python.3.14", "--exact", "--source", "winget", "--silent", "--accept-package-agreements", "--accept-source-agreements")
+        Invoke-Native "winget" (Get-WingetInstallArguments "Python.Python.3.14")
         Update-SessionPath
     }
+# The mayors run on these two command-line programs; the owner still signs in to each one personally.
+foreach ($package in @(@{ Name = "claude"; Id = "Anthropic.ClaudeCode" }, @{ Name = "codex"; Id = "OpenAI.Codex" })) {
+    $p = $package
+    Invoke-Step -Name ("install-" + $p.Name) -Plan ("winget install --id " + $p.Id) `
+        -IsDone { Test-Command $p.Name } `
+        -Action {
+            Invoke-Native "winget" (Get-WingetInstallArguments $p.Id)
+            Update-SessionPath
+        }
+}
 
 # 2. GitHub sign-in (browser; the owner approves the one-time device code) ---------------------------
 Invoke-Step -Name "gh-login" -Plan "gh auth login --web --hostname github.com --git-protocol https (approve in the browser)" `
@@ -272,13 +313,25 @@ Invoke-Step -Name "machine-bootstrap" -Plan "scripts\Initialize-AIMachine.ps1 -P
     -IsDone {
         $wrapper = Join-Path $InstallRoot "scripts\Invoke-AIController.ps1"
         if (-not (Test-Path -LiteralPath $wrapper)) { return $false }
+        foreach ($index in @("session-routing.md", "projects.md", "workspace-map.md")) {
+            if (-not (Test-Path -LiteralPath (Join-Path $SecondBrainPath ("90_System\indexes\" + $index)) -PathType Leaf)) { return $false }
+        }
         $out = Get-NativeText (Get-PsExe) @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $wrapper, "rules-sync", "check")
         return ([bool]$out -and $out -match '"status":\s*"current"')
     } `
     -Action {
         $init = Join-Path $InstallRoot "scripts\Initialize-AIMachine.ps1"
-        & (Get-PsExe) -NoProfile -ExecutionPolicy Bypass -File $init -Profile default -SecondBrainPath $SecondBrainPath `
-            -ProjectRegistryPath $ProjectRegistryPath -ApproveMachineBootstrap
+        $initArguments = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $init, "-Profile", "default",
+            "-SecondBrainPath", $SecondBrainPath, "-ProjectRegistryPath", $ProjectRegistryPath, "-ApproveMachineBootstrap")
+        # A freshly cloned Second Brain has no system indexes (Git never syncs them): this computer builds its own.
+        # Existing hosts already have them and take the unchanged path.
+        $indexRoot = Join-Path $SecondBrainPath "90_System\indexes"
+        $indexesMissing = @(@("session-routing.md", "projects.md", "workspace-map.md") |
+            Where-Object { -not (Test-Path -LiteralPath (Join-Path $indexRoot $_) -PathType Leaf) })
+        if ($indexesMissing.Count -gt 0) {
+            $initArguments += @("-InitializeHostIndexes", "-ExpectedBrainOrigin", $SecondBrainRepository)
+        }
+        & (Get-PsExe) @initArguments
         if ($LASTEXITCODE -ne 0) { throw "Initialize-AIMachine.ps1 failed (exit $LASTEXITCODE)" }
     }
 
