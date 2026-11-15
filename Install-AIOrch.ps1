@@ -187,6 +187,26 @@ function Get-PsExe {
     return "powershell"
 }
 
+# A fresh Tailscale install opens a "Welcome to Tailscale" window over the installer (2026-11-15 full rerun). Its
+# "Get Started" button signs the computer in to Tailscale's own service instead of CielSpace, and the window hid
+# the installer's next question. Closing the window is what its X button does; the tray program keeps running.
+function Close-TailscaleWelcome {
+    param([int]$WaitSeconds = 0, [string]$ProcessName = "tailscale-ipn", [string]$Title = "Tailscale")
+    $deadline = (Get-Date).AddSeconds($WaitSeconds)
+    $closed = $false
+    do {
+        foreach ($proc in @(Get-Process -Name $ProcessName -ErrorAction SilentlyContinue)) {
+            if ($proc.MainWindowHandle -ne [IntPtr]::Zero -and $proc.MainWindowTitle -eq $Title) {
+                try { if ($proc.CloseMainWindow()) { $closed = $true } } catch { }
+            }
+        }
+        if ($closed -or (Get-Date) -ge $deadline) { break }
+        Start-Sleep -Milliseconds 500
+    } while ($true)
+    if ($closed -and -not $Json) { Write-Host "Closed the Tailscale welcome window (this computer joins CielSpace, not Tailscale's own service)." }
+    return $closed
+}
+
 Update-SessionPath
 
 # 1. Tools ------------------------------------------------------------------------------------------
@@ -212,6 +232,7 @@ Invoke-Step -Name "install-tools-once" -Plan "one administrator approval for the
             Write-Host "The single administrator approval was not given; installing the tools one by one."
         }
         Update-SessionPath
+        if ($ids -contains "Tailscale.Tailscale") { [void](Close-TailscaleWelcome -WaitSeconds 20) }
     }
 foreach ($package in $packages) {
     $p = $package
@@ -221,6 +242,7 @@ foreach ($package in $packages) {
             if (-not (Test-Command "winget")) { throw "winget is missing; install App Installer from the Microsoft Store first." }
             Invoke-Native "winget" (Get-WingetInstallArguments $p.Id)
             Update-SessionPath
+            if ($p.Name -eq "tailscale") { [void](Close-TailscaleWelcome -WaitSeconds 20) }
         }
 }
 Invoke-Step -Name "install-python314" -Plan "winget install --id Python.Python.3.14" `
@@ -264,6 +286,7 @@ Invoke-Step -Name "script-policy" -Plan "execution policy RemoteSigned for this 
     }
 
 # 2. GitHub sign-in (browser; the owner approves the one-time device code) ---------------------------
+if (-not $DryRun -and -not (Test-TailscaleConnected)) { [void](Close-TailscaleWelcome) }
 Invoke-Step -Name "gh-login" -Plan "gh auth login --web --hostname github.com --git-protocol https (approve in the browser)" `
     -IsDone { Test-GhLoggedIn } `
     -Action {
@@ -317,6 +340,7 @@ if ($LoginServer) {
     $loginPlan = "tailscale up --login-server $LoginServer"
     $approvePlan = "; approve the device from a host already on that network"
 }
+if (-not $DryRun -and -not (Test-TailscaleConnected)) { [void](Close-TailscaleWelcome) }
 Invoke-Step -Name "tailnet" -Plan ($loginPlan + $approvePlan) `
     -IsDone {
         if (-not (Test-TailscaleConnected)) { return $false }
