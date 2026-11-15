@@ -16,4 +16,4 @@ With parameters (for example a dry run that changes nothing):
 
 Windows 10/11 with winget. Re-running is safe: finished steps are skipped.
 
-SHA-256 of Install-AIOrch.ps1: `ae0f06b5d260ff31262627f95afdf847d1ae6598602f8450704ed1d4c8ab7538`
+SHA-256 of Install-AIOrch.ps1: `a0d35a801b609f432a0f01b590bb02a8fc7f30cf6f0c4afff60b942d2a9623fc`

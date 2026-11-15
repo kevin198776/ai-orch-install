@@ -241,6 +241,28 @@ Invoke-Step -Name "install-claude" -Plan "winget install --id Anthropic.ClaudeCo
         Update-SessionPath
     }
 
+# A fresh Windows refuses every .ps1 ("running scripts is disabled on this system"), so the owner could not run
+# a maintenance script such as Restart-AIWorkPet.ps1 by hand (2026-11-15 VM). RemoteSigned for this user only:
+# no administrator approval; scripts cloned by git run, files downloaded by a browser still need a signature.
+# A policy forced by the organisation (MachinePolicy / UserPolicy) wins and is left alone.
+function Test-ScriptPolicyAllows {
+    foreach ($scope in @("MachinePolicy", "UserPolicy", "CurrentUser", "LocalMachine")) {
+        $policy = [string](Get-ExecutionPolicy -Scope $scope)
+        if ($policy -ne "Undefined") { return (@("RemoteSigned", "Unrestricted", "Bypass") -contains $policy) }
+    }
+    return $false
+}
+Invoke-Step -Name "script-policy" -Plan "execution policy RemoteSigned for this user only (no administrator)" `
+    -IsDone { Test-ScriptPolicyAllows } `
+    -Action {
+        # "Set-ExecutionPolicy" raises when another scope (this process, or the organisation) overrides the
+        # value it just stored; the stored value is what counts for later windows.
+        try { Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned -Force } catch { }
+        if (-not (Test-ScriptPolicyAllows)) {
+            if (-not $Json) { Write-Host "[warn] script-policy: the execution policy is set by the organisation; run maintenance scripts with: powershell -ExecutionPolicy Bypass -File <script>" }
+        }
+    }
+
 # 2. GitHub sign-in (browser; the owner approves the one-time device code) ---------------------------
 Invoke-Step -Name "gh-login" -Plan "gh auth login --web --hostname github.com --git-protocol https (approve in the browser)" `
     -IsDone { Test-GhLoggedIn } `
