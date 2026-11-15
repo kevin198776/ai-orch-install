@@ -272,13 +272,31 @@ Invoke-Step -Name "gh-login" -Plan "gh auth login --web --hostname github.com --
     }
 
 # 3. Code -------------------------------------------------------------------------------------------
-Invoke-Step -Name "clone" -Plan ("gh repo clone {0} {1} -- --filter=blob:none" -f $Repository, $InstallRoot) `
-    -IsDone { Test-GitRepo $InstallRoot } `
+# A full checkout is about 1.7 GB, nearly all of it PNG files a running Ciel never opens (2026-11-15 VM: the
+# clone alone downloaded more than 1 GB). The repository lists what a new computer needs in
+# scripts/new-host-sparse-checkout.txt; only that is checked out. Later updates keep the same selection.
+$SparseSpec = "scripts/new-host-sparse-checkout.txt"
+function Test-CodeCheckedOut {
+    return ((Test-GitRepo $InstallRoot) -and (Test-Path -LiteralPath (Join-Path $InstallRoot "orchestrator.py")))
+}
+Invoke-Step -Name "clone" -Plan ("gh repo clone {0} {1} -- --filter=blob:none --no-checkout; sparse checkout from {2}" -f $Repository, $InstallRoot, $SparseSpec) `
+    -IsDone { Test-CodeCheckedOut } `
     -Action {
-        if ((Test-Path -LiteralPath $InstallRoot) -and @(Get-ChildItem -LiteralPath $InstallRoot -Force).Count -gt 0) {
-            throw "InstallRoot exists, is not empty and is not a git clone: $InstallRoot"
+        if (-not (Test-GitRepo $InstallRoot)) {
+            if ((Test-Path -LiteralPath $InstallRoot) -and @(Get-ChildItem -LiteralPath $InstallRoot -Force).Count -gt 0) {
+                throw "InstallRoot exists, is not empty and is not a git clone: $InstallRoot"
+            }
+            Invoke-Native "gh" @("repo", "clone", $Repository, $InstallRoot, "--", "--filter=blob:none", "--no-checkout")
         }
-        Invoke-Native "gh" @("repo", "clone", $Repository, $InstallRoot, "--", "--filter=blob:none")
+        # A clone that stopped before its checkout (network loss) continues here on the next run.
+        $spec = Get-NativeText "git" @("-C", $InstallRoot, "show", ("HEAD:" + $SparseSpec))
+        if ($spec) {
+            Invoke-Native "git" @("-C", $InstallRoot, "sparse-checkout", "init", "--no-cone")
+            $specFile = Join-Path $InstallRoot ".git\info\sparse-checkout"
+            $specText = ($spec -replace "`r`n", "`n").TrimEnd() + "`n"
+            [System.IO.File]::WriteAllText($specFile, $specText, (New-Object System.Text.UTF8Encoding($false)))
+        }
+        Invoke-Native "git" @("-C", $InstallRoot, "checkout", "main")
     }
 Invoke-Step -Name "venv" -Plan "py -3.14 -m venv .venv; pip install -e .[desktop]" `
     -IsDone {
