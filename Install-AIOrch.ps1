@@ -96,6 +96,54 @@ function Invoke-Native {
     if ($LASTEXITCODE -ne 0) { throw ("Command failed (exit {0}): {1} {2}" -f $LASTEXITCODE, $File, ($Arguments -join " ")) }
 }
 
+# Pairing code (docs/SELF_HOSTED_NETWORK_PLAN.md, "security hardening"): the approval page shows the first six
+# characters of sha256(registration id); this computer shows the same, so only its own request gets approved.
+function Get-PairingCode([string]$Text) {
+    $m = [regex]::Match([string]$Text, '/register/([A-Za-z0-9_-]{8,200})')
+    if (-not $m.Success) { return $null }
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { $bytes = $sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($m.Groups[1].Value)) } finally { $sha.Dispose() }
+    $hex = (-join ($bytes[0..2] | ForEach-Object { $_.ToString('x2') })).ToUpperInvariant()
+    return ($hex.Substring(0, 3) + '-' + $hex.Substring(3))
+}
+
+# Runs "tailscale up/login" against the self-hosted control server, shows the pairing code as soon as the client
+# prints its registration address, and waits for approval. The address itself is never shown and the temp files
+# are deleted. Returns the exit code ($null when it cannot be read). It never ends the client process.
+function Invoke-TailscaleJoin([string]$Exe, [string[]]$Arguments) {
+    $log = [IO.Path]::GetTempFileName()
+    try {
+        $p = Start-Process -FilePath $Exe -NoNewWindow -PassThru -RedirectStandardOutput $log `
+            -RedirectStandardError "$log.err" -ArgumentList $Arguments
+        $null = $p.Handle      # keep the handle, or ExitCode reads empty once the process is gone
+        $shown = $false
+        while (-not $p.WaitForExit(1000)) {
+            if (-not $shown) {
+                $text = ''
+                foreach ($f in @($log, "$log.err")) {
+                    try {
+                        $fs = [IO.File]::Open($f, 'Open', 'Read', 'ReadWrite')
+                        try { $text += (New-Object IO.StreamReader($fs)).ReadToEnd() } finally { $fs.Dispose() }
+                    } catch { }
+                }
+                $code = Get-PairingCode $text
+                if ($code) {
+                    $shown = $true
+                    Write-Host ''
+                    Write-Host "  PAIRING CODE: $code" -ForegroundColor Yellow
+                    Write-Host '  Open Ciel on a computer that is already connected and press approve'
+                    Write-Host '  only on the request that shows this same code.'
+                    Write-Host ''
+                }
+            }
+        }
+        $p.WaitForExit()
+        return $p.ExitCode
+    } finally {
+        Remove-Item -LiteralPath $log, "$log.err" -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Invoke-Step {
     param([string]$Name, [string]$Plan, [scriptblock]$IsDone, [scriptblock]$Action)
     # IsDone probes must be read-only and handle their own errors; an exception here (for example the
@@ -355,9 +403,12 @@ Invoke-Step -Name "tailnet" -Plan ($loginPlan + $approvePlan) `
         return $true
     } `
     -Action {
-        $arguments = @("up")
-        if ($LoginServer) { $arguments += @("--login-server", $LoginServer) }
-        Invoke-Native "tailscale" $arguments
+        if ($LoginServer) {
+            $exit = Invoke-TailscaleJoin "tailscale" @("up", "--login-server", $LoginServer)
+            if ($null -ne $exit -and $exit -ne 0) { throw ("tailscale up failed (exit {0})" -f $exit) }
+        } else {
+            Invoke-Native "tailscale" @("up")
+        }
     }
 
 # 5. Second Brain and machine bootstrap --------------------------------------------------------------
